@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from dateutil import tz
 
 from arrow import locales
-from arrow.constants import MAX_TIMESTAMP, MAX_TIMESTAMP_MS, MAX_TIMESTAMP_US
+from arrow.util import iso_to_gregorian, next_weekday, normalize_timestamp
 
 try:
     from functools import lru_cache
@@ -31,7 +31,7 @@ class ParserMatchError(ParserError):
 class DateTimeParser(object):
 
     _FORMAT_RE = re.compile(
-        r"(YYY?Y?|MM?M?M?|Do|DD?D?D?|d?d?d?d|HH?|hh?|mm?|ss?|S+|ZZ?Z?|a|A|x|X)"
+        r"(YYY?Y?|MM?M?M?|Do|DD?D?D?|d?d?d?d|HH?|hh?|mm?|ss?|S+|ZZ?Z?|a|A|x|X|W)"
     )
     _ESCAPE_RE = re.compile(r"\[[^\[\]]*\]")
 
@@ -49,6 +49,7 @@ class DateTimeParser(object):
     _TIMESTAMP_RE = re.compile(r"^\-?\d+\.?\d+$")
     _TIMESTAMP_EXPANDED_RE = re.compile(r"^\-?\d+$")
     _TIME_RE = re.compile(r"^(\d{2})(?:\:?(\d{2}))?(?:\:?(\d{2}))?(?:([\.\,])(\d+))?$")
+    _WEEK_DATE_RE = re.compile(r"(?P<year>\d{4})[\-]?W(?P<week>\d{2})[\-]?(?P<day>\d)?")
 
     _BASE_INPUT_RE_MAP = {
         "YYYY": _FOUR_DIGIT_RE,
@@ -73,6 +74,7 @@ class DateTimeParser(object):
         "ZZ": _TZ_ZZ_RE,
         "Z": _TZ_Z_RE,
         "S": _ONE_OR_MORE_DIGIT_RE,
+        "W": _WEEK_DATE_RE,
     }
 
     SEPARATORS = ["-", "/", "."]
@@ -112,8 +114,11 @@ class DateTimeParser(object):
 
     # TODO: since we support more than ISO 8601, we should rename this function
     # IDEA: break into multiple functions
-    def parse_iso(self, datetime_string):
-        # TODO: add a flag to normalize whitespace (useful in logs, ref issue #421)
+    def parse_iso(self, datetime_string, normalize_whitespace=False):
+
+        if normalize_whitespace:
+            datetime_string = re.sub(r"\s+", " ", datetime_string.strip())
+
         has_space_divider = " " in datetime_string
         has_t_divider = "T" in datetime_string
 
@@ -147,6 +152,7 @@ class DateTimeParser(object):
             "YYYY/MM",
             "YYYY.MM",
             "YYYY",
+            "W",
         ]
 
         if has_time:
@@ -210,7 +216,10 @@ class DateTimeParser(object):
 
         return self._parse_multiformat(datetime_string, formats)
 
-    def parse(self, datetime_string, fmt):
+    def parse(self, datetime_string, fmt, normalize_whitespace=False):
+
+        if normalize_whitespace:
+            datetime_string = re.sub(r"\s+", " ", datetime_string)
 
         if isinstance(fmt, list):
             return self._parse_multiformat(datetime_string, fmt)
@@ -218,6 +227,7 @@ class DateTimeParser(object):
         fmt_tokens, fmt_pattern_re = self._generate_pattern_re(fmt)
 
         match = fmt_pattern_re.search(datetime_string)
+
         if match is None:
             raise ParserMatchError(
                 "Failed to match '{}' when parsing '{}'".format(fmt, datetime_string)
@@ -227,6 +237,8 @@ class DateTimeParser(object):
         for token in fmt_tokens:
             if token == "Do":
                 value = match.group("value")
+            elif token == "W":
+                value = (match.group("year"), match.group("week"), match.group("day"))
             else:
                 value = match.group(token)
             self._parse_token(token, value, parts)
@@ -292,9 +304,19 @@ class DateTimeParser(object):
         # and time string in a natural language sentence. Therefore, searching
         # for a string of the form YYYY-MM-DD in "blah 1998-09-12 blah" will
         # work properly.
-        # Reference: https://stackoverflow.com/q/14232931/3820660
-        starting_word_boundary = r"(?<![\S])"
-        ending_word_boundary = r"(?![\S])"
+        # Certain punctuation before or after the target pattern such as
+        # "1998-09-12," is permitted. For the full list of valid punctuation,
+        # see the documentation.
+
+        starting_word_boundary = (
+            r"(?<!\S\S)"  # Don't have two consecutive non-whitespace characters. This ensures that we allow cases like .11.25.2019 but not 1.11.25.2019 (for pattern MM.DD.YYYY)
+            r"(?<![^\,\.\;\:\?\!\"\'\`\[\]\{\}\(\)<>\s])"  # This is the list of punctuation that is ok before the pattern (i.e. "It can't not be these characters before the pattern")
+            r"(\b|^)"  # The \b is to block cases like 1201912 but allow 201912 for pattern YYYYMM. The ^ was necessary to allow a negative number through i.e. before epoch numbers
+        )
+        ending_word_boundary = (
+            r"(?=[\,\.\;\:\?\!\"\'\`\[\]\{\}\(\)\<\>]?"  # Positive lookahead stating that these punctuation marks can appear after the pattern at most 1 time
+            r"(?!\S))"  # Don't allow any non-whitespace character after the punctuation
+        )
         bounded_fmt_pattern = r"{}{}{}".format(
             starting_word_boundary, final_fmt_pattern, ending_word_boundary
         )
@@ -322,8 +344,22 @@ class DateTimeParser(object):
         elif token in ["DD", "D"]:
             parts["day"] = int(value)
 
-        elif token in ["Do"]:
+        elif token == "Do":
             parts["day"] = int(value)
+
+        elif token == "dddd":
+            # locale day names are 1-indexed
+            day_of_week = [x.lower() for x in self.locale.day_names].index(
+                value.lower()
+            )
+            parts["day_of_week"] = day_of_week - 1
+
+        elif token == "ddd":
+            # locale day abbreviations are 1-indexed
+            day_of_week = [x.lower() for x in self.locale.day_abbreviations].index(
+                value.lower()
+            )
+            parts["day_of_week"] = day_of_week - 1
 
         elif token.upper() in ["HH", "H"]:
             parts["hour"] = int(value)
@@ -366,8 +402,28 @@ class DateTimeParser(object):
             elif value in (self.locale.meridians["pm"], self.locale.meridians["PM"]):
                 parts["am_pm"] = "pm"
 
+        elif token == "W":
+            parts["weekdate"] = value
+
     @staticmethod
     def _build_datetime(parts):
+
+        weekdate = parts.get("weekdate")
+
+        if weekdate is not None:
+            # we can use strptime (%G, %V, %u) in python 3.6 but these tokens aren't available before that
+            year, week = int(weekdate[0]), int(weekdate[1])
+
+            if weekdate[2] is not None:
+                day = int(weekdate[2])
+            else:
+                # day not given, default to 1
+                day = 1
+
+            dt = iso_to_gregorian(year, week, day)
+            parts["year"] = dt.year
+            parts["month"] = dt.month
+            parts["day"] = dt.day
 
         timestamp = parts.get("timestamp")
 
@@ -377,20 +433,10 @@ class DateTimeParser(object):
         expanded_timestamp = parts.get("expanded_timestamp")
 
         if expanded_timestamp is not None:
-
-            if expanded_timestamp > MAX_TIMESTAMP:
-                if expanded_timestamp < MAX_TIMESTAMP_MS:
-                    expanded_timestamp /= 1000.0
-                elif expanded_timestamp < MAX_TIMESTAMP_US:
-                    expanded_timestamp /= 1000000.0
-                else:
-                    raise ValueError(
-                        "The specified timestamp '{}' is too large.".format(
-                            expanded_timestamp
-                        )
-                    )
-
-            return datetime.fromtimestamp(expanded_timestamp, tz=tz.tzutc())
+            return datetime.fromtimestamp(
+                normalize_timestamp(expanded_timestamp),
+                tz=tz.tzutc(),
+            )
 
         day_of_year = parts.get("day_of_year")
 
@@ -418,6 +464,24 @@ class DateTimeParser(object):
             parts["year"] = dt.year
             parts["month"] = dt.month
             parts["day"] = dt.day
+
+        day_of_week = parts.get("day_of_week")
+        day = parts.get("day")
+
+        # If day is passed, ignore day of week
+        if day_of_week is not None and day is None:
+            year = parts.get("year", 1970)
+            month = parts.get("month", 1)
+            day = 1
+
+            # dddd => first day of week after epoch
+            # dddd YYYY => first day of week in specified year
+            # dddd MM YYYY => first day of week in specified year and month
+            # dddd MM => first day after epoch in specified month
+            next_weekday_dt = next_weekday(datetime(year, month, day), day_of_week)
+            parts["year"] = next_weekday_dt.year
+            parts["month"] = next_weekday_dt.month
+            parts["day"] = next_weekday_dt.day
 
         am_pm = parts.get("am_pm")
         hour = parts.get("hour", 0)
