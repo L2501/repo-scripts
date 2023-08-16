@@ -1,76 +1,91 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-    requests_cache.backends
-    ~~~~~~~~~~~~~~~~~~~~~~~
+"""Classes and functions for cache persistence. See :ref:`backends` for general usage info."""
+# flake8: noqa: F401
+from logging import getLogger
+from typing import Callable, Dict, Iterable, Optional, Type, Union
 
-    Classes and functions for cache persistence
-"""
+from .._utils import get_placeholder_class, get_valid_kwargs
+from .base import BaseCache, BaseStorage, DictStorage
+
+# Backend-specific keyword arguments equivalent to 'cache_name'
+CACHE_NAME_KWARGS = ['db_path', 'db_name', 'namespace', 'table_name']
+
+BackendSpecifier = Union[str, BaseCache]
+logger = getLogger(__name__)
 
 
-from .base import BaseCache
+# Import all backend classes for which dependencies are installed
+try:
+    from .dynamodb import DynamoDbCache, DynamoDbDict
+except ImportError as e:
+    DynamoDbCache = DynamoDbDict = get_placeholder_class(e)  # type: ignore
 
-registry = {
+try:
+    from .gridfs import GridFSCache, GridFSDict
+except ImportError as e:
+    GridFSCache = GridFSDict = get_placeholder_class(e)  # type: ignore
+
+try:
+    from .mongodb import MongoCache, MongoDict
+except ImportError as e:
+    MongoCache = MongoDict = get_placeholder_class(e)  # type: ignore
+
+try:
+    from .redis import RedisCache, RedisDict, RedisHashDict
+except ImportError as e:
+    RedisCache = RedisDict = RedisHashDict = get_placeholder_class(e)  # type: ignore
+
+try:
+    from .sqlite import SQLiteCache, SQLiteDict
+except ImportError as e:
+    SQLiteCache = SQLiteDict = get_placeholder_class(e)  # type: ignore
+
+try:
+    from .filesystem import FileCache, FileDict
+except ImportError as e:
+    FileCache = FileDict = get_placeholder_class(e)  # type: ignore
+
+
+BACKEND_CLASSES = {
+    'dynamodb': DynamoDbCache,
+    'filesystem': FileCache,
+    'gridfs': GridFSCache,
     'memory': BaseCache,
+    'mongodb': MongoCache,
+    'redis': RedisCache,
+    'sqlite': SQLiteCache,
 }
 
-_backend_dependencies = {
-    'sqlite': 'sqlite3',
-    'mongo': 'pymongo',
-    'redis': 'redis',
-    'dynamodb': 'dynamodb'
-}
 
-try:
-    # Heroku doesn't allow the SQLite3 module to be installed
-    from .sqlite import DbCache
-    registry['sqlite'] = DbCache
-except ImportError:
-    DbCache = None
+def init_backend(
+    cache_name: str, backend: Optional[BackendSpecifier] = None, **kwargs
+) -> BaseCache:
+    """Initialize a backend from a name, class, or instance"""
+    logger.debug(f'Initializing backend: {backend} {cache_name}')
 
-try:
-    from .mongo import MongoCache
-    registry['mongo'] = registry['mongodb'] = MongoCache
-except ImportError:
-    MongoCache = None
+    # The 'cache_name' arg has a different purpose depending on the backend. If an equivalent
+    # backend-specific keyword arg is specified, handle that here to avoid conflicts with the
+    # 'cache_name' positional-or-keyword arg. In hindsight, a consistent positional-only or
+    # keyword-only arg would have been better, but probably not worth a breaking change.
+    cache_name_kwargs = [kwargs.pop(k) for k in CACHE_NAME_KWARGS if k in kwargs]
+    cache_name = cache_name or cache_name_kwargs[0]
 
+    # Already a backend instance
+    if isinstance(backend, BaseCache):
+        if cache_name:
+            backend.cache_name = cache_name
+        return backend
+    # If no backend is specified, use SQLite as default, unless the environment doesn't support it
+    # TODO: Deprecate fallback to memory?
+    #   Unsupported SQLite is a rare case, and should probably be handled by the user instead.
+    elif not backend:
+        sqlite_supported = issubclass(BACKEND_CLASSES['sqlite'], BaseCache)
+        backend = 'sqlite' if sqlite_supported else 'memory'
 
-try:
-    from .gridfs import GridFSCache
-    registry['gridfs'] = GridFSCache
-except ImportError:
-    GridFSCache = None
-
-try:
-    from .redis import RedisCache
-    registry['redis'] = RedisCache
-except ImportError:
-    RedisCache = None
-
-try:
-    from .dynamodb import DynamoDbCache
-    registry['dynamodb'] = DynamoDbCache
-except ImportError:
-    DynamoDbCache = None
-
-def create_backend(backend_name, cache_name, options):
-    if isinstance(backend_name, BaseCache):
-        return backend_name
-
-    if backend_name is None:
-        backend_name = _get_default_backend_name()
-    try:
-        return registry[backend_name](cache_name, **options)
-    except KeyError:
-        if backend_name in _backend_dependencies:
-            raise ImportError('You must install the python package: %s' %
-                              _backend_dependencies[backend_name])
-        else:
-            raise ValueError('Unsupported backend "%s" try one of: %s' %
-                             (backend_name, ', '.join(registry.keys())))
-
-
-def _get_default_backend_name():
-    if 'sqlite' in registry:
-        return 'sqlite'
-    return 'memory'
+    # Get backend class by name
+    backend = str(backend).lower()
+    if backend not in BACKEND_CLASSES:
+        raise ValueError(
+            f'Invalid backend: {backend}. Provide a backend instance, or choose from one of the '
+            f'following aliases: {list(BACKEND_CLASSES.keys())}'
+        )
+    return BACKEND_CLASSES[backend](cache_name, **kwargs)

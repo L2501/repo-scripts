@@ -1,31 +1,13 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-    requests_cache
-    ~~~~~~~~~~~~~~
+# flake8: noqa: E402,F401
 
-    Transparent cache for ``requests`` library with persistence and async support
+# Version is defined in pyproject.toml.
+# It's copied here to make it easier for client code to check the installed version.
+__version__ = '1.1.0'
 
-    Just write::
-
-        import requests_cache
-        requests_cache.install_cache()
-
-    And requests to resources will be cached for faster repeated access::
-
-        import requests
-        for i in range(10):
-            r = requests.get('http://httpbin.org/delay/5')
-        # will took  approximately 5 seconds instead 50
-
-
-    :copyright: (c) 2012 by Roman Haritonov.
-    :license: BSD, see LICENSE for more details.
-"""
-__docformat__ = 'restructuredtext'
-__version__ = '0.5.2'
-
-from .core import (
-    CachedSession, install_cache, uninstall_cache,
-    disabled, enabled, get_cache, clear, configure, remove_expired_responses
-)
+from .backends import *
+from .cache_keys import *
+from .models import *
+from .patcher import *
+from .policy import *
+from .serializers import *
+from .session import *
